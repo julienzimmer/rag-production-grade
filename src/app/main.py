@@ -19,9 +19,13 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+import app.db.models  # noqa: F401  — enregistre les modèles dans Base.metadata
 from app.api.v1.health import router as health_router
+from app.api.v1.ingest import router as ingest_router
+from app.api.v1.query import router as query_router
 from app.config import get_settings
 from app.core.logging import configure_logging
+from app.db.engine import Base, init_db
 
 logger = structlog.get_logger(__name__)
 
@@ -33,9 +37,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     Pourquoi lifespan plutôt que @app.on_event ?
     on_event est déprécié depuis FastAPI 0.93. Le context manager lifespan
-    permet de partager des ressources (pool de connexions DB, etc.) entre
-    le démarrage et l'arrêt de façon propre — sera enrichi en Phase 2
-    avec l'initialisation du pool asyncpg.
+    permet de partager des ressources entre le démarrage et l'arrêt de façon propre.
+
+    Séquence de démarrage :
+    1. Configurer les logs structurés
+    2. Initialiser le pool de connexions PostgreSQL
+    3. Créer les tables (idempotent — IF NOT EXISTS)
+    4. Yield (l'app est prête à servir les requêtes)
+    5. Fermer le pool à l'arrêt
     """
     settings = get_settings()
     configure_logging(level=settings.log_level)
@@ -44,7 +53,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         environment=settings.environment,
         version=settings.app_version,
     )
+
+    engine, _ = init_db(
+        database_url=str(settings.database_url),
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        echo=settings.debug,
+    )
+
+    # create_all est idempotent (CREATE TABLE IF NOT EXISTS) — safe en dev et prod
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("database_initialized")
+
     yield
+
+    await engine.dispose()
     logger.info("application_shutdown")
 
 
@@ -71,6 +95,8 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(health_router, prefix=settings.api_v1_prefix)
+    app.include_router(ingest_router, prefix=settings.api_v1_prefix)
+    app.include_router(query_router, prefix=settings.api_v1_prefix)
 
     return app
 

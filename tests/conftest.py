@@ -7,14 +7,24 @@ Principes de conception :
 2. `dependency_overrides` est le mécanisme FastAPI pour injecter des settings
    de test sans modifier les fichiers .env.
 3. Les fixtures sont scopées selon leur coût :
-   - "session" : créé une seule fois pour toute la session de tests (setup coûteux)
-   - "function" (défaut) : recréé pour chaque test (isolation maximale)
+   - "session" : créé une seule fois pour toute la session de tests (DB, app)
+   - "function" (défaut) : recréé pour chaque test (sessions DB, mocks)
+
+Stratégie de test DB :
+- db_engine (session) : crée les tables une fois, les supprime en fin de session
+- db_session (function) : session fraîche par test, rollback après chaque test
+  → isolation des données sans avoir à vider les tables manuellement
 """
 
 import pytest
+import pytest_asyncio
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+# Import des modèles pour les enregistrer dans Base.metadata
+import app.db.models  # noqa: F401
 from app.config import Settings, get_settings
+from app.db.engine import Base, get_db
 from app.main import create_app
 
 
@@ -26,10 +36,40 @@ def test_settings() -> Settings:
     """
     return Settings(
         environment="development",
-        debug=True,
-        database_url="postgresql+asyncpg://rag_user:rag_password@localhost:5432/rag_test_db",  # noqa: E501
+        debug=False,
+        database_url="postgresql+asyncpg://rag_user:rag_password@localhost:5432/rag_test_db",
         log_level="DEBUG",
     )
+
+
+@pytest_asyncio.fixture(scope="session")
+async def db_engine(test_settings: Settings):
+    """
+    Crée le moteur de test et initialise le schéma DB.
+    Supprime toutes les tables à la fin de la session de tests.
+    """
+    engine = create_async_engine(str(test_settings.database_url), echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def db_session(db_engine) -> AsyncSession:
+    """
+    Session DB isolée par rollback pour chaque test.
+
+    Pourquoi le rollback plutôt que TRUNCATE ?
+    Plus rapide et sans risque d'interférence entre tests parallèles.
+    Les données créées dans un test sont invisibles aux autres.
+    """
+    session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+    async with session_factory() as session:
+        yield session
+        await session.rollback()
 
 
 @pytest.fixture(scope="session")
@@ -43,11 +83,27 @@ def app(test_settings: Settings):
     return application
 
 
+@pytest.fixture
+def client_with_db(app, db_session: AsyncSession):
+    """
+    Client HTTP de test avec la session DB injectée.
+    Permet de vérifier l'état de la DB après chaque requête HTTP.
+    """
+
+    async def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app, raise_server_exceptions=True) as c:
+        yield c
+    app.dependency_overrides.pop(get_db, None)
+
+
 @pytest.fixture(scope="session")
 def client(app) -> TestClient:
     """
-    Client de test synchrone — idéal pour les tests unitaires sans async.
-    Pour les tests async, utiliser httpx.AsyncClient avec app= parameter.
+    Client de test synchrone — idéal pour les tests unitaires sans DB.
+    Pour les tests avec DB, utiliser client_with_db.
     """
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c

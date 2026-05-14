@@ -45,6 +45,9 @@ rag = [
     "langchain>=0.2.0",
     "langchain-openai>=0.1.0",
     "langchain-community>=0.2.0",
+    # langchain-text-splitters est le package séparé pour RecursiveCharacterTextSplitter
+    # (extrait de langchain core depuis la v0.2 pour réduire les dépendances)
+    "langchain-text-splitters>=0.2.0",
     "llama-index>=0.10.0",
     "openai>=1.30.0",
     "tiktoken>=0.7.0",

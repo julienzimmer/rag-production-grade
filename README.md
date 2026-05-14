@@ -11,13 +11,13 @@ Un système **RAG (Retrieval-Augmented Generation)** permet à un LLM de répond
 ```
 Document PDF/texte
        ↓
-  [Ingestion]     → découpage en chunks → embeddings OpenAI → pgvector
+  [Ingestion]     → extraction texte → chunking → embeddings OpenAI → pgvector
        ↓
-  [Retrieval]     → embedding de la question → recherche de similarité cosine
+  [Retrieval]     → embedding de la question → distance cosine → top-k chunks
        ↓
-  [Generation]    → contexte + question → LLM → réponse
+  [Generation]    → contexte + question → gpt-4o-mini → réponse + sources
        ↓
-  [Évaluation]    → RAGAs / DeepEval → métriques de qualité
+  [Évaluation]    → RAGAs / DeepEval → métriques de qualité  (Phase 4)
 ```
 
 ## Stack technique
@@ -27,7 +27,7 @@ Document PDF/texte
 | API | Python 3.11 · FastAPI · Uvicorn |
 | Validation | Pydantic v2 · pydantic-settings |
 | Base de données | PostgreSQL · pgvector · SQLAlchemy async · asyncpg |
-| Pipeline RAG | LangChain · LlamaIndex · OpenAI |
+| Pipeline RAG | LangChain · LangChain-OpenAI · OpenAI SDK |
 | Observabilité | structlog · LangSmith · Langfuse · OpenTelemetry |
 | Évaluation | RAGAs · DeepEval |
 | Infrastructure | Docker · GitHub Actions · Terraform · AWS (EC2, S3, ECR) |
@@ -37,29 +37,42 @@ Document PDF/texte
 ```
 rag_production_grade/
 ├── src/app/
-│   ├── main.py              # App factory FastAPI (pattern create_app + lifespan)
+│   ├── main.py              # App factory FastAPI + lifespan (init DB, routers)
 │   ├── config.py            # Pydantic Settings — toute la config via .env
 │   ├── api/v1/
-│   │   └── health.py        # GET /api/v1/health (liveness probe Docker/K8s)
+│   │   ├── health.py        # GET  /api/v1/health  (liveness probe Docker/K8s)
+│   │   ├── ingest.py        # POST /api/v1/ingest  (upload → chunking → pgvector)
+│   │   └── query.py         # POST /api/v1/query   (retrieve + generate)
 │   ├── core/
 │   │   ├── logging.py       # structlog — JSON en prod, console colorée en dev
 │   │   └── exceptions.py    # Exceptions HTTP personnalisées
+│   ├── db/
+│   │   ├── engine.py        # init_db() + get_db() — moteur SQLAlchemy async
+│   │   └── models.py        # ORM : Document, Chunk (Vector 1536 dims + index HNSW)
 │   └── rag/
-│       ├── ingestion/       # Phase 2 — chargement, chunking, embeddings
-│       ├── retrieval/       # Phase 2 — vector search, reranking
-│       └── generation/      # Phase 2 — prompt, LLM, réponse
+│       ├── ingestion/
+│       │   ├── loader.py    # Extraction texte : PDF (PyPDF) + texte/markdown
+│       │   ├── chunker.py   # RecursiveCharacterTextSplitter (LangChain)
+│       │   └── embedder.py  # OpenAI text-embedding-3-small, batch
+│       ├── retrieval/
+│       │   └── retriever.py # Recherche pgvector — distance cosine <=>
+│       └── generation/
+│           └── generator.py # ChatOpenAI gpt-4o-mini, temperature=0
 ├── tests/
-│   ├── conftest.py          # Fixtures pytest (TestClient, settings de test)
+│   ├── conftest.py          # Fixtures : test_settings, db_engine, db_session, client_with_db
 │   ├── unit/
+│   │   └── test_chunker.py  # 8 tests unitaires (zéro I/O)
 │   └── integration/
+│       ├── test_ingest.py   # 5 tests d'intégration (DB réelle, OpenAI mocké)
+│       └── test_query.py    # 4 tests d'intégration (DB réelle, OpenAI mocké)
 ├── scripts/
-│   └── init_db.sql          # CREATE EXTENSION vector (auto au premier start)
+│   └── init_db.sql          # CREATE EXTENSION vector + uuid-ossp (auto au 1er start)
 ├── infra/                   # Terraform — Phase 3
 ├── .github/workflows/
 │   └── ci.yml               # Lint → Test (avec pgvector réel)
 ├── Dockerfile               # Multi-stage: base → builder → dev / production
-├── docker-compose.yml       # postgres (pgvector) + app
-├── pyproject.toml           # Dépendances groupées (core / dev / rag / eval / observability)
+├── docker-compose.yml       # postgres (pgvector) + app (hot-reload)
+├── pyproject.toml           # Dépendances groupées : core / dev / rag / eval / observability
 └── .env.example             # Toutes les variables d'environnement documentées
 ```
 
@@ -68,6 +81,7 @@ rag_production_grade/
 ### Prérequis
 - Docker & Docker Compose
 - Python 3.11 (pour le développement local)
+- Clé API OpenAI (pour l'ingestion et les requêtes RAG)
 
 ### Avec Docker (recommandé)
 
@@ -78,14 +92,25 @@ cd rag-production-grade
 
 # 2. Configurer l'environnement
 cp .env.example .env
-# Éditer .env avec vos clés (OpenAI, etc.)
+# Éditer .env — au minimum : OPENAI_API_KEY=sk-...
 
-# 3. Lancer les services
+# 3. Lancer les services (postgres + app)
 docker-compose up
 
 # 4. Vérifier que l'app tourne
 curl http://localhost:8000/api/v1/health
 # → {"status":"ok","version":"0.1.0","environment":"development"}
+
+# 5. Ingérer un document
+curl -X POST http://localhost:8000/api/v1/ingest \
+  -F "file=@mon_document.pdf"
+# → {"document_id":"...","filename":"mon_document.pdf","chunks_created":42,"message":"..."}
+
+# 6. Interroger la base de connaissances
+curl -X POST http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Que dit le document sur X ?", "top_k": 5}'
+# → {"query":"...","answer":"...","sources":[...],"total_sources":5}
 ```
 
 ### En local (sans Docker)
@@ -95,11 +120,65 @@ curl http://localhost:8000/api/v1/health
 python3.11 -m venv .venv
 source .venv/bin/activate
 
-pip install -e ".[dev]"
+# Dépendances core + dev + rag
+pip install -e ".[dev,rag]"
 cp .env.example .env
+# Éditer .env avec OPENAI_API_KEY et DATABASE_URL pointant vers un pgvector local
 
 pytest tests/
 uvicorn src.app.main:app --reload
+```
+
+## API — Endpoints Phase 2
+
+### `POST /api/v1/ingest`
+
+Upload d'un document (PDF ou texte) — le pipeline complet s'exécute dans la requête.
+
+```
+Content-Type: multipart/form-data
+Body: file (PDF, text/plain, text/markdown)
+```
+
+```json
+// Réponse 201
+{
+  "document_id": "550e8400-e29b-41d4-a716-446655440000",
+  "filename": "rapport_2024.pdf",
+  "chunks_created": 87,
+  "message": "Document ingéré avec succès : 87 chunks créés"
+}
+```
+
+### `POST /api/v1/query`
+
+Interrogation RAG : embed → retrieve → generate.
+
+```json
+// Corps de la requête
+{
+  "query": "Quels sont les points clés du rapport ?",
+  "top_k": 5
+}
+```
+
+```json
+// Réponse 200
+{
+  "query": "Quels sont les points clés du rapport ?",
+  "answer": "D'après le document [Source 1 : rapport_2024.pdf], les points clés sont...",
+  "sources": [
+    {
+      "chunk_id": "...",
+      "document_id": "...",
+      "filename": "rapport_2024.pdf",
+      "content": "Extrait du document...",
+      "chunk_index": 12,
+      "score": 0.8742
+    }
+  ],
+  "total_sources": 5
+}
 ```
 
 ## Dépendances — rôle de chaque package
@@ -116,43 +195,45 @@ uvicorn src.app.main:app --reload
 
 **`asyncpg`** — Driver PostgreSQL pur-async écrit en C. C'est lui qui parle réellement à PostgreSQL — envoie les requêtes SQL et reçoit les résultats sans bloquer le thread. Utilisé par SQLAlchemy comme backend (`postgresql+asyncpg://`).
 
-**`sqlalchemy[asyncio]>=2.0`** — L'ORM. Traduit des objets Python en SQL, gère le pool de connexions. En Phase 2, définira les tables (`documents`, `chunks`, `embeddings`) et permettra d'écrire des requêtes sans SQL brut.
+**`sqlalchemy[asyncio]>=2.0`** — L'ORM. Traduit des objets Python en SQL, gère le pool de connexions. En Phase 2, définit les tables `documents` et `chunks` et permet les requêtes pgvector via les opérateurs SQLAlchemy.
 
-**`pgvector`** — Client Python pour l'extension pgvector de PostgreSQL. Ajoute le type `Vector` à SQLAlchemy et permet les requêtes de similarité : `ORDER BY embedding <=> query_vector` (distance cosine). La brique fondamentale du RAG : stocker et chercher des embeddings directement en DB.
+**`pgvector`** — Client Python pour l'extension pgvector de PostgreSQL. Ajoute le type `Vector` à SQLAlchemy et permet les requêtes de similarité : `Chunk.embedding.cosine_distance(query_vector)`. La brique fondamentale du RAG : stocker et chercher des embeddings directement en DB.
 
-**`httpx`** — Client HTTP async. Utilisé par le `TestClient` de FastAPI et pour les futures intégrations (appels vers Supabase, webhooks). Plus moderne que `requests` qui est synchrone uniquement.
+**`httpx`** — Client HTTP async. Utilisé par le `TestClient` de FastAPI et pour les futures intégrations.
 
-**`structlog`** — Logging structuré. Produit du JSON en production (parseable par CloudWatch, Grafana Loki, Datadog) et un affichage coloré lisible en développement. Permet d'attacher des champs clés-valeurs aux logs : `logger.info("embedding_created", doc_id="abc", duration_ms=142)`.
+**`structlog`** — Logging structuré. Produit du JSON en production (parseable par CloudWatch, Grafana Loki, Datadog) et un affichage coloré lisible en développement. Attache des champs clés-valeurs aux logs : `logger.info("embedding_created", count=87, model="text-embedding-3-small")`.
 
 ### Dev `[dev]`
 
 **`pytest`** — Framework de tests. Découvre automatiquement les fichiers `test_*.py` et rapporte les échecs avec un diff lisible.
 
-**`pytest-asyncio`** — Plugin pour écrire des tests `async def`. Sans lui, pytest ne sait pas exécuter du code async.
+**`pytest-asyncio`** — Plugin pour écrire des tests `async def`. Sans lui, pytest ne sait pas exécuter du code async. Configuré en `asyncio_mode = "auto"` : tous les tests async sont automatiquement gérés.
 
 **`pytest-cov`** — Mesure la couverture de code. Génère `coverage.xml` uploadé vers Codecov dans la CI.
 
 **`ruff`** — Linter ET formatter en Rust. Remplace `flake8` + `isort` + `black`. Instantané même sur de gros projets.
 
-**`mypy`** — Vérificateur de types statique. Lit les annotations (`def get(id: str) -> Document`) et signale les incohérences avant l'exécution. Configuré en mode `strict`.
+**`mypy`** — Vérificateur de types statique. Lit les annotations et signale les incohérences avant l'exécution. Configuré en mode `strict`.
 
-**`faker`** — Génère des données de test réalistes (`faker.name()`, `faker.paragraph()`). En Phase 2, crée des documents fictifs pour tester l'ingestion.
+**`faker`** — Génère des données de test réalistes. Disponible pour la Phase 4 (documents fictifs pour l'évaluation RAGAs).
 
 ### RAG `[rag]` — Phase 2
 
-**`langchain`** — Orchestration du pipeline RAG : enchaîne les étapes "charge → découpe → embeds → stocke → récupère → génère".
+**`langchain>=0.2`** — Orchestration du pipeline RAG. Utilisé pour le text splitting (`RecursiveCharacterTextSplitter`) et comme framework LLM.
 
-**`langchain-openai`** — Connecteur LangChain → API OpenAI (embeddings `text-embedding-3-small` + LLM `gpt-4o-mini`).
+**`langchain-text-splitters>=0.2`** — Package séparé contenant les splitters (extrait du core LangChain depuis la v0.2 pour réduire les dépendances transitives). Fournit `RecursiveCharacterTextSplitter`.
 
-**`llama-index`** — Alternative/complément à LangChain, excellent pour l'indexation et la recherche avancée de documents.
+**`langchain-openai>=0.1`** — Connecteur LangChain → API OpenAI. Utilisé pour `ChatOpenAI` (génération) dans `generator.py`.
 
-**`openai`** — SDK officiel OpenAI. Appelé par langchain-openai en dessous.
+**`langchain-community>=0.2`** — Intégrations communautaires LangChain (disponible pour les extensions futures).
 
-**`tiktoken`** — Tokenizer OpenAI. Compte les tokens pour ne pas dépasser les limites de contexte lors du chunking.
+**`openai>=1.30`** — SDK officiel OpenAI. Appelé directement dans `embedder.py` via `AsyncOpenAI` pour générer les embeddings en batch (plus de contrôle sur le batching que via LangChain).
 
-**`pypdf`** — Lecture des fichiers PDF — le format de document le plus courant en entreprise.
+**`tiktoken>=0.7`** — Tokenizer OpenAI. Permet de compter les tokens pour ne pas dépasser les limites de contexte.
 
-**`python-multipart`** — Nécessaire pour que FastAPI accepte les uploads de fichiers (`UploadFile`).
+**`pypdf>=4.2`** — Extraction de texte depuis les PDF. Utilisé dans `loader.py`. Limitation : ne supporte pas les PDF scannés (images sans texte — nécessiterait OCR).
+
+**`python-multipart>=0.0.9`** — Nécessaire pour que FastAPI accepte les uploads de fichiers (`UploadFile` dans `POST /ingest`).
 
 ### Observabilité `[observability]` — Phase 3
 
@@ -170,7 +251,64 @@ uvicorn src.app.main:app --reload
 
 **`deepeval`** — Framework de tests unitaires pour LLMs. Permet d'écrire des assertions sur les sorties et de les intégrer dans la CI.
 
-## Architecture des décisions techniques
+## Architecture — décisions techniques
+
+### Couche DB : engine.py et le pattern init_db()
+
+Le moteur SQLAlchemy est initialisé dans la fonction `lifespan` de FastAPI (au démarrage), pas au niveau module. Raison : pouvoir passer une URL différente dans les tests sans modifier les fichiers de config.
+
+```python
+# main.py — lifespan
+engine, _ = init_db(database_url=str(settings.database_url), ...)
+async with engine.begin() as conn:
+    await conn.run_sync(Base.metadata.create_all)  # CREATE TABLE IF NOT EXISTS
+```
+
+`get_db()` est une dépendance FastAPI injectée par `Depends` dans chaque handler. Elle yield une session par requête HTTP et la ferme automatiquement (même en cas d'exception) via le context manager.
+
+### Modèles ORM : pourquoi chunks et embeddings dans la même table ?
+
+Un chunk a exactement un embedding (relation 1:1). Les séparer en deux tables n'apporterait qu'un JOIN inutile. L'index HNSW de pgvector opère directement sur la colonne `embedding` de la table `chunks`.
+
+```sql
+-- Index créé automatiquement par SQLAlchemy au create_all()
+CREATE INDEX ix_chunks_embedding_hnsw ON chunks
+  USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+```
+
+`m=16` : connexions par nœud (précision ↔ mémoire). `ef_construction=64` : qualité de l'index à la construction.
+
+### Chunking : RecursiveCharacterTextSplitter
+
+Le splitter tente de couper dans cet ordre : `\n\n` → `\n` → `. ` → espace → caractère. Il préserve la cohérence sémantique en respectant la structure naturelle du texte (paragraphes avant phrases avant mots). Paramètres : `chunk_size=1000` chars (~250 tokens), `chunk_overlap=200` chars.
+
+### Embeddings : AsyncOpenAI direct (pas via LangChain)
+
+L'API OpenAI accepte plusieurs textes en un seul appel HTTP. Appeler `embed_texts([chunk1, chunk2, ..., chunkN])` coûte un seul round-trip réseau, quelle que soit la taille du document. LangChain's `OpenAIEmbeddings` ne donne pas ce niveau de contrôle sur le batching — d'où l'appel direct au SDK `openai`.
+
+### Distance cosine : score ∈ [0, 1]
+
+pgvector retourne une distance cosine ∈ [0, 2]. On la convertit en score lisible :
+
+```python
+score = round(1.0 - distance / 2.0, 4)
+# 0 = aucune similarité, 1 = identiques
+```
+
+### Stratégie de tests : DB réelle, OpenAI mocké
+
+Les tests d'intégration utilisent un vrai conteneur pgvector (`rag_test_db`). L'API OpenAI est mockée avec `unittest.mock.AsyncMock` — pour ne pas consommer de tokens en CI et rendre les tests déterministes.
+
+Chaque test dispose d'une session DB isolée par rollback : les données créées dans un test ne polluent pas les autres.
+
+```python
+@pytest_asyncio.fixture
+async def db_session(db_engine) -> AsyncSession:
+    async with session_factory() as session:
+        yield session
+        await session.rollback()  # isolation garantie
+```
 
 ### Pourquoi le pattern `create_app()` ?
 
@@ -179,23 +317,12 @@ Si `app` était une variable module-level, les tests importeraient l'instance av
 ```python
 application = create_app()
 application.dependency_overrides[get_settings] = lambda: test_settings
+application.dependency_overrides[get_db] = override_get_db
 ```
-
-### Pourquoi `lifespan` plutôt que `@app.on_event` ?
-
-`on_event("startup")` est déprécié depuis FastAPI 0.93. Le context manager `lifespan` gère proprement le cycle démarrage/arrêt et permettra en Phase 2 d'initialiser le pool de connexions DB et de le fermer proprement.
-
-### Pourquoi des groupes de dépendances optionnels ?
-
-L'image Docker de production n'installe que les dépendances core. LangChain (>100 MB) n'est ajouté qu'en Phase 2. Moins de surface d'attaque, image plus légère, builds plus rapides.
 
 ### Pourquoi `condition: service_healthy` dans docker-compose ?
 
 Sans cette condition, l'app démarre avant que PostgreSQL accepte des connexions et plante au premier accès DB. Le healthcheck `pg_isready` garantit que la DB est réellement prête.
-
-### Pourquoi un vrai PostgreSQL dans la CI plutôt qu'un mock ?
-
-Mocker pgvector annulerait l'intérêt de tester la logique de vector search. La CI lance un vrai conteneur `ankane/pgvector` pour détecter les régressions réelles.
 
 ### Dockerfile multi-stage — astuce cache
 
@@ -210,23 +337,37 @@ Si tu modifies uniquement le code (pas les dépendances), `pip install` n'est pa
 
 ## Phases de développement
 
-- [x] **Phase 1** — Scaffolding : structure, FastAPI, Docker, CI
-- [ ] **Phase 2** — Pipeline RAG : ingestion PDF, chunking, embeddings, pgvector, API query
+- [x] **Phase 1** — Scaffolding : FastAPI, Docker, CI, health endpoint
+- [x] **Phase 2** — Pipeline RAG : ingestion PDF/texte, chunking, embeddings, pgvector, API query + generate
 - [ ] **Phase 3** — Observabilité : LangSmith, Langfuse, OpenTelemetry
 - [ ] **Phase 4** — Évaluation : RAGAs, DeepEval, métriques de qualité
 
 ## Commandes utiles
 
 ```bash
-docker-compose up          # Lancer en local
-pytest tests/              # Tests
-ruff check .               # Lint
-ruff format .              # Formatage
+# Démarrage
+docker-compose up                        # Lance postgres + app
+
+# Tests
+pytest tests/                            # Tous les tests
+pytest tests/unit/                       # Tests unitaires uniquement (sans DB)
+pytest tests/integration/               # Tests d'intégration (nécessite pgvector)
+pytest -m unit                           # Par marqueur
+pytest -m integration                    # Par marqueur
+
+# Qualité
+ruff check .                             # Lint
+ruff format .                            # Formatage
+
+# Installation
+pip install -e ".[dev]"                  # Dev sans RAG
+pip install -e ".[dev,rag]"             # Dev + pipeline RAG complet
 ```
 
 ## Variables d'environnement
 
-Voir [.env.example](.env.example) pour la liste complète et documentée.
+Voir [.env.example](.env.example) pour la liste complète et documentée.  
+Variables minimales pour Phase 2 : `DATABASE_URL` + `OPENAI_API_KEY`.
 
 ---
 
