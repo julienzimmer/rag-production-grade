@@ -1,0 +1,59 @@
+# Environnement de développement local.
+#
+# Décisions de conception :
+# - postgres utilise ankane/pgvector — image officielle qui inclut l'extension,
+#   évite de compiler pgvector manuellement.
+# - Le service app monte src/ en volume pour le hot-reload : les changements
+#   de code sont répercutés sans rebuild de l'image.
+# - healthcheck sur postgres : l'app ne démarre qu'après que la DB soit prête.
+#   "depends_on: condition: service_healthy" est la bonne approche —
+#   pas un sleep dans le script d'entrée.
+
+services:
+  postgres:
+    image: ankane/pgvector:v0.7.0    # Version épinglée pour la reproductibilité
+    container_name: rag_postgres
+    environment:
+      POSTGRES_DB: rag_db
+      POSTGRES_USER: rag_user
+      POSTGRES_PASSWORD: rag_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag_user -d rag_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: rag_app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src:ro           # Hot-reload : les changements sont immédiats
+      - ./.env:/app/.env:ro
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://rag_user:rag_password@postgres:5432/rag_db
+      - ENVIRONMENT=development
+      - DEBUG=true
+    depends_on:
+      postgres:
+        condition: service_healthy   # Démarre uniquement après le health check DB
+    command: >
+      uvicorn src.app.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-dir /app/src
+
+volumes:
+  postgres_data:
+    name: rag_postgres_data
