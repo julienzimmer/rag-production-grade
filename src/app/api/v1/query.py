@@ -22,6 +22,23 @@ from app.rag.retrieval.retriever import retrieve_similar_chunks
 router = APIRouter(tags=["query"])
 logger = structlog.get_logger(__name__)
 
+# Import conditionnel : si langfuse n'est pas installé, l'endpoint reste fonctionnel
+try:
+    # Langfuse v4 : observe et get_client dans le package racine
+    from langfuse import get_client as langfuse_get_client
+    from langfuse import observe as langfuse_observe
+
+    _LANGFUSE_AVAILABLE = True
+except ImportError:
+    _LANGFUSE_AVAILABLE = False
+    langfuse_get_client = None  # type: ignore[assignment]
+
+    def langfuse_observe(name: str):  # type: ignore[misc]
+        """Décorateur no-op si Langfuse n'est pas installé."""
+        def decorator(func):  # type: ignore[misc]
+            return func
+        return decorator
+
 
 class QueryRequest(BaseModel):
     query: str = Field(
@@ -52,6 +69,7 @@ class QueryResponse(BaseModel):
 
 
 @router.post("/query", response_model=QueryResponse)
+@langfuse_observe(name="rag_query_pipeline")
 async def query_documents(
     request: QueryRequest,
     db: AsyncSession = Depends(get_db),
@@ -61,7 +79,19 @@ async def query_documents(
 
     Retourne la réponse générée et les chunks sources utilisés.
     Si aucun document n'est indexé, retourne un message explicite.
+
+    Le décorateur @langfuse_observe crée la trace Langfuse racine.
+    Les spans enfants (embed, retrieve, generate) s'y attachent automatiquement
+    via la propagation de contexte asyncio (contextvars).
     """
+    # Enrichir la trace Langfuse avec les métadonnées de la requête.
+    # En Langfuse v4, get_client() retourne le client global configuré via env vars.
+    # Si les credentials sont absents, les appels sont des no-ops silencieux.
+    if _LANGFUSE_AVAILABLE and langfuse_get_client:
+        client = langfuse_get_client()
+        client.set_current_trace_io(input=request.query)
+        client.update_current_span(metadata={"top_k": request.top_k})
+
     # Retrieve
     try:
         chunks = await retrieve_similar_chunks(request.query, db, top_k=request.top_k)
@@ -84,6 +114,12 @@ async def query_documents(
         answer = await generate_answer(request.query, chunks)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if _LANGFUSE_AVAILABLE and langfuse_get_client:
+        langfuse_get_client().update_current_span(
+            output=answer,
+            metadata={"chunks_used": len(chunks)},
+        )
 
     logger.info(
         "rag_query_completed",

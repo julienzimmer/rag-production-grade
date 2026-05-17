@@ -73,6 +73,14 @@ class Settings(BaseSettings):
     langfuse_public_key: str | None = None
     langfuse_host: str = "https://cloud.langfuse.com"
 
+    # LangChain lit LANGCHAIN_TRACING_V2 et LANGCHAIN_API_KEY directement
+    # depuis os.environ (pas depuis Settings). On les déclare ici pour :
+    # 1. documenter leur existence, 2. les propager explicitement dans le lifespan,
+    # 3. permettre aux tests de les surcharger via dependency_overrides.
+    langchain_tracing_v2: bool = False
+    # Même valeur que langsmith_api_key — LangChain utilise ce nom de variable.
+    langchain_api_key: SecretStr | None = None
+
     # --- AWS ---
     aws_region: str = "eu-west-1"
     aws_s3_bucket: str | None = None

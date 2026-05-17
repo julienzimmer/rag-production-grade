@@ -107,3 +107,23 @@ def client(app) -> TestClient:
     """
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def disable_observability(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Désactive LangSmith et Langfuse pour tous les tests.
+
+    Pourquoi autouse=True ?
+    Sans cette fixture, de vraies clés présentes dans l'environnement CI
+    (variables d'env du runner) pourraient "fuir" dans les tests et
+    déclencher de vrais appels réseau vers les services cloud.
+
+    Langfuse : @observe devient un no-op dès que les clés sont vides.
+    LangSmith : LANGCHAIN_TRACING_V2=false désactive le callback LangChain.
+    OpenTelemetry : aucune action requise — get_tracer() retourne un NoOpTracer
+    quand aucun TracerProvider n'est configuré (comportement par défaut OTel).
+    """
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")

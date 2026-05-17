@@ -23,6 +23,20 @@ from app.rag.ingestion.loader import SUPPORTED_MIME_TYPES, load_document
 router = APIRouter(tags=["ingestion"])
 logger = structlog.get_logger(__name__)
 
+try:
+    from langfuse import get_client as langfuse_get_client
+    from langfuse import observe as langfuse_observe
+
+    _LANGFUSE_AVAILABLE = True
+except ImportError:
+    _LANGFUSE_AVAILABLE = False
+    langfuse_get_client = None  # type: ignore[assignment]
+
+    def langfuse_observe(name: str):  # type: ignore[misc]
+        def decorator(func):  # type: ignore[misc]
+            return func
+        return decorator
+
 
 class IngestResponse(BaseModel):
     document_id: str
@@ -32,6 +46,7 @@ class IngestResponse(BaseModel):
 
 
 @router.post("/ingest", response_model=IngestResponse, status_code=201)
+@langfuse_observe(name="rag_ingest_pipeline")
 async def ingest_document(
     file: UploadFile = File(..., description="Document PDF ou texte à ingérer"),
     db: AsyncSession = Depends(get_db),
@@ -41,6 +56,11 @@ async def ingest_document(
 
     Retourne l'identifiant du document créé et le nombre de chunks indexés.
     """
+    if _LANGFUSE_AVAILABLE and langfuse_get_client:
+        langfuse_get_client().update_current_span(
+            metadata={"filename": file.filename, "mime_type": file.content_type},
+        )
+
     mime_type = file.content_type or "application/octet-stream"
     if mime_type not in SUPPORTED_MIME_TYPES:
         raise HTTPException(

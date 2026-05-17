@@ -12,6 +12,7 @@ Lancer en dev :
     uvicorn src.app.main:app --reload
 """
 
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -25,6 +26,8 @@ from app.api.v1.ingest import router as ingest_router
 from app.api.v1.query import router as query_router
 from app.config import get_settings
 from app.core.logging import configure_logging
+from app.core.telemetry import setup_telemetry
+from app.core.tracing import flush_langfuse
 from app.db.engine import Base, init_db
 
 logger = structlog.get_logger(__name__)
@@ -41,10 +44,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     Séquence de démarrage :
     1. Configurer les logs structurés
-    2. Initialiser le pool de connexions PostgreSQL
-    3. Créer les tables (idempotent — IF NOT EXISTS)
-    4. Yield (l'app est prête à servir les requêtes)
-    5. Fermer le pool à l'arrêt
+    2. Activer le tracing LangSmith si configuré (propagation os.environ)
+    3. Initialiser le pool de connexions PostgreSQL
+    4. Créer les tables (idempotent — IF NOT EXISTS)
+    5. Yield (l'app est prête à servir les requêtes)
+    6. Flush Langfuse + fermer le pool à l'arrêt
     """
     settings = get_settings()
     configure_logging(level=settings.log_level)
@@ -53,6 +57,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         environment=settings.environment,
         version=settings.app_version,
     )
+
+    # --- LangSmith ---
+    # LangChain lit LANGCHAIN_TRACING_V2 et LANGCHAIN_API_KEY directement depuis
+    # os.environ (pas depuis Pydantic Settings). On propage explicitement pour que
+    # la config .env soit respectée, même dans un conteneur Docker qui injecte
+    # les vars via Settings mais pas toujours dans os.environ.
+    if settings.langchain_tracing_v2 and settings.langchain_api_key:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_API_KEY"] = settings.langchain_api_key.get_secret_value()
+        os.environ["LANGCHAIN_PROJECT"] = settings.langsmith_project
+        logger.info("langsmith_tracing_enabled", project=settings.langsmith_project)
 
     engine, _ = init_db(
         database_url=str(settings.database_url),
@@ -68,6 +83,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
+    # --- Shutdown ---
+    # Langfuse envoie les traces en batch (non-bloquant). Sans flush, les derniers
+    # events avant l'arrêt (Ctrl+C, redéploiement K8s) pourraient être perdus.
+    flush_langfuse()
     await engine.dispose()
     logger.info("application_shutdown")
 
@@ -84,6 +103,22 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if settings.environment != "production" else None,
         openapi_url="/openapi.json" if settings.environment != "production" else None,
     )
+
+    # --- OpenTelemetry ---
+    # setup_telemetry configure le TracerProvider global (ConsoleExporter en dev).
+    # instrument_app() ajoute un middleware FastAPI qui crée automatiquement un span
+    # HTTP par requête (http.method, http.route, http.status_code, durée).
+    # Doit être appelé AVANT add_middleware pour capturer aussi les middlewares custom.
+    setup_telemetry(
+        service_name=settings.app_name,
+        environment=settings.environment,
+    )
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        FastAPIInstrumentor.instrument_app(app)
+    except ImportError:
+        logger.warning("otel_fastapi_instrumentor_not_installed")
 
     # CORS — doit être ajouté avant les routers
     app.add_middleware(

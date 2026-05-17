@@ -37,7 +37,7 @@ Document PDF/texte
 ```
 rag_production_grade/
 ├── src/app/
-│   ├── main.py              # App factory FastAPI + lifespan (init DB, routers)
+│   ├── main.py              # App factory FastAPI + lifespan (init DB, OTel, routers)
 │   ├── config.py            # Pydantic Settings — toute la config via .env
 │   ├── api/v1/
 │   │   ├── health.py        # GET  /api/v1/health  (liveness probe Docker/K8s)
@@ -45,6 +45,8 @@ rag_production_grade/
 │   │   └── query.py         # POST /api/v1/query   (retrieve + generate)
 │   ├── core/
 │   │   ├── logging.py       # structlog — JSON en prod, console colorée en dev
+│   │   ├── tracing.py       # Langfuse v4 : observe, get_langfuse_callback_handler()
+│   │   ├── telemetry.py     # OpenTelemetry : setup_telemetry(), get_tracer()
 │   │   └── exceptions.py    # Exceptions HTTP personnalisées
 │   ├── db/
 │   │   ├── engine.py        # init_db() + get_db() — moteur SQLAlchemy async
@@ -53,21 +55,24 @@ rag_production_grade/
 │       ├── ingestion/
 │       │   ├── loader.py    # Extraction texte : PDF (PyPDF) + texte/markdown
 │       │   ├── chunker.py   # RecursiveCharacterTextSplitter (LangChain)
-│       │   └── embedder.py  # OpenAI text-embedding-3-small, batch
+│       │   └── embedder.py  # OpenAI text-embedding-3-small, batch + span OTel rag.embed
 │       ├── retrieval/
-│       │   └── retriever.py # Recherche pgvector — distance cosine <=>
+│       │   └── retriever.py # Recherche pgvector cosine <=> + span OTel rag.retrieve
 │       └── generation/
-│           └── generator.py # ChatOpenAI gpt-4o-mini, temperature=0
+│           └── generator.py # ChatOpenAI gpt-4o-mini + LangfuseCallbackHandler + span OTel rag.generate
 ├── tests/
 │   ├── conftest.py          # Fixtures : test_settings, db_engine, db_session, client_with_db
+│   │                        #           + fixture autouse disable_observability
 │   ├── unit/
-│   │   └── test_chunker.py  # 8 tests unitaires (zéro I/O)
+│   │   ├── test_chunker.py  # 8 tests unitaires (zéro I/O)
+│   │   ├── test_tracing.py  # 3 tests — helpers Langfuse (credentials présents/absents)
+│   │   └── test_telemetry.py# 4 tests — spans OTel (InMemorySpanExporter)
 │   └── integration/
 │       ├── test_ingest.py   # 5 tests d'intégration (DB réelle, OpenAI mocké)
 │       └── test_query.py    # 4 tests d'intégration (DB réelle, OpenAI mocké)
 ├── scripts/
 │   └── init_db.sql          # CREATE EXTENSION vector + uuid-ossp (auto au 1er start)
-├── infra/                   # Terraform — Phase 3
+├── infra/                   # Terraform — Phase déploiement
 ├── .github/workflows/
 │   └── ci.yml               # Lint → Test (avec pgvector réel)
 ├── Dockerfile               # Multi-stage: base → builder → dev / production
@@ -180,6 +185,81 @@ Interrogation RAG : embed → retrieve → generate.
   "total_sources": 5
 }
 ```
+
+## Observabilité — Phase 3
+
+Trois niveaux d'instrumentation complémentaires, chacun activable indépendamment.
+
+### Architecture de tracing
+
+```
+Requête HTTP
+     │
+     ▼
+[FastAPI]  ←── OpenTelemetry (span HTTP automatique : method, route, status, durée)
+     │
+     ├── POST /api/v1/ingest ──── @observe("rag_ingest_pipeline")  ←── trace Langfuse racine
+     │       └── embed_texts()   ←── span OTel "rag.embed"
+     │
+     └── POST /api/v1/query ───── @observe("rag_query_pipeline")   ←── trace Langfuse racine
+             ├── retrieve_similar_chunks() ←── span OTel "rag.retrieve"
+             │       └── embed_texts()     ←── span OTel "rag.embed"
+             └── generate_answer()         ←── span OTel "rag.generate"
+                     └── ChatOpenAI.ainvoke() ←── LangSmith auto-trace
+                                              ←── LangfuseCallbackHandler (tokens, latence LLM)
+```
+
+### 1. LangSmith — tracing automatique LangChain
+
+Capture chaque appel `ChatOpenAI` : prompt complet, réponse, tokens consommés, latence. Aucune modification du code requise — LangChain détecte `LANGCHAIN_TRACING_V2=true` automatiquement.
+
+```ini
+# Dans .env
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=ls__...      # clé disponible sur https://smith.langchain.com
+LANGCHAIN_PROJECT=rag-production-grade
+```
+
+Résultat : chaque `POST /query` crée une trace dans LangSmith avec le prompt système, la question, la réponse et l'usage de tokens.
+
+### 2. Langfuse — tracing bout-en-bout du pipeline RAG
+
+Trace l'ensemble du pipeline (pas seulement le LLM) : embedding, retrieval, génération, avec leurs durées imbriquées. Utilise Langfuse v4 — cloud gratuit sur [cloud.langfuse.com](https://cloud.langfuse.com).
+
+```ini
+# Dans .env
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
+```
+
+Implémentation :
+- `@observe(name="rag_query_pipeline")` sur l'endpoint → trace racine
+- Spans enfants automatiques sur `retrieve_similar_chunks()`, `embed_texts()`
+- `LangfuseCallbackHandler` injecté dans `ChatOpenAI.ainvoke()` → span LLM avec tokens
+
+Désactivé si les credentials sont absents (no-op transparent).
+
+### 3. OpenTelemetry — instrumentation infrastructure
+
+Standard CNCF. Actif en permanence, aucune configuration requise.
+
+En développement : spans JSON affichés sur stdout (via `ConsoleSpanExporter`).  
+En production : brancher un `OTLPSpanExporter` vers Grafana Tempo, Jaeger, ou Honeycomb.
+
+Spans custom créés : `rag.embed`, `rag.retrieve`, `rag.generate` avec attributs métier (`rag.texts_count`, `rag.top_k`, `rag.results_count`, `rag.model`...).  
+Auto-instrumentation FastAPI : span HTTP par requête (`http.method`, `http.route`, `http.status_code`).
+
+### Tests d'observabilité
+
+Les outils cloud (LangSmith, Langfuse) sont désactivés automatiquement dans les tests via une fixture `autouse` qui vide les credentials. OTel retourne un `NoOpTracer` sans provider configuré.
+
+```bash
+pytest tests/unit/test_tracing.py    # helpers Langfuse
+pytest tests/unit/test_telemetry.py  # spans OTel (InMemorySpanExporter)
+```
+
+---
 
 ## Dépendances — rôle de chaque package
 
@@ -339,7 +419,7 @@ Si tu modifies uniquement le code (pas les dépendances), `pip install` n'est pa
 
 - [x] **Phase 1** — Scaffolding : FastAPI, Docker, CI, health endpoint
 - [x] **Phase 2** — Pipeline RAG : ingestion PDF/texte, chunking, embeddings, pgvector, API query + generate
-- [ ] **Phase 3** — Observabilité : LangSmith, Langfuse, OpenTelemetry
+- [x] **Phase 3** — Observabilité : LangSmith, Langfuse v4, OpenTelemetry
 - [ ] **Phase 4** — Évaluation : RAGAs, DeepEval, métriques de qualité
 
 ## Commandes utiles
@@ -360,14 +440,20 @@ ruff check .                             # Lint
 ruff format .                            # Formatage
 
 # Installation
-pip install -e ".[dev]"                  # Dev sans RAG
-pip install -e ".[dev,rag]"             # Dev + pipeline RAG complet
+pip install -e ".[dev]"                        # Dev sans RAG
+pip install -e ".[dev,rag]"                   # Dev + pipeline RAG complet
+pip install -e ".[dev,rag,observability]"     # Dev + RAG + observabilité (Phase 3)
 ```
 
 ## Variables d'environnement
 
-Voir [.env.example](.env.example) pour la liste complète et documentée.  
-Variables minimales pour Phase 2 : `DATABASE_URL` + `OPENAI_API_KEY`.
+Voir [.env.example](.env.example) pour la liste complète et documentée.
+
+| Phase | Variables minimales |
+|-------|---------------------|
+| Phase 2 (RAG) | `DATABASE_URL` + `OPENAI_API_KEY` |
+| Phase 3 (LangSmith) | + `LANGCHAIN_TRACING_V2=true` + `LANGCHAIN_API_KEY` |
+| Phase 3 (Langfuse) | + `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` |
 
 ---
 

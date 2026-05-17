@@ -16,6 +16,7 @@ import structlog
 from openai import AsyncOpenAI
 
 from app.config import get_settings
+from app.core.telemetry import get_tracer
 
 logger = structlog.get_logger(__name__)
 
@@ -37,17 +38,27 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY non configurée — ajoutez-la dans .env")
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key.get_secret_value())
-    all_embeddings: list[list[float]] = []
+    # Span OTel : mesure la durée totale d'embedding (tous batches confondus).
+    # start_as_current_span est un context manager analogue au try-with-resources Java.
+    # Le span est automatiquement fermé (et son statut ERROR si exception) à la sortie.
+    # En tests, get_tracer() retourne un NoOpTracer — aucun effet de bord.
+    with get_tracer().start_as_current_span("rag.embed") as span:
+        span.set_attribute("rag.texts_count", len(texts))
+        span.set_attribute("rag.model", settings.openai_embedding_model)
 
-    for batch_start in range(0, len(texts), _BATCH_SIZE):
-        batch = texts[batch_start : batch_start + _BATCH_SIZE]
-        response = await client.embeddings.create(
-            model=settings.openai_embedding_model,
-            input=batch,
-        )
-        # Les embeddings sont retournés dans l'ordre des inputs
-        all_embeddings.extend(item.embedding for item in response.data)
+        client = AsyncOpenAI(api_key=settings.openai_api_key.get_secret_value())
+        all_embeddings: list[list[float]] = []
+
+        for batch_start in range(0, len(texts), _BATCH_SIZE):
+            batch = texts[batch_start : batch_start + _BATCH_SIZE]
+            response = await client.embeddings.create(
+                model=settings.openai_embedding_model,
+                input=batch,
+            )
+            # Les embeddings sont retournés dans l'ordre des inputs
+            all_embeddings.extend(item.embedding for item in response.data)
+
+        span.set_attribute("rag.embeddings_count", len(all_embeddings))
 
     logger.info(
         "embeddings_created",

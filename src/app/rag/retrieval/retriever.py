@@ -15,6 +15,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.telemetry import get_tracer
 from app.db.models import Chunk, Document
 from app.rag.ingestion.embedder import embed_texts
 
@@ -33,28 +34,34 @@ async def retrieve_similar_chunks(
     similaire en premier). Chaque dict contient le contenu du chunk
     et les métadonnées du document source pour la citation.
     """
-    # 1. Embedder la requête — même modèle que l'ingestion (obligatoire)
-    query_embeddings = await embed_texts([query])
-    query_vector = query_embeddings[0]
+    with get_tracer().start_as_current_span("rag.retrieve") as span:
+        span.set_attribute("rag.query_length", len(query))
+        span.set_attribute("rag.top_k", top_k)
 
-    # 2. Requête pgvector : distance cosine ORDER BY ASC = plus proche en premier
-    stmt = (
-        select(
-            Chunk.id,
-            Chunk.content,
-            Chunk.chunk_index,
-            Document.filename,
-            Document.id.label("document_id"),
-            Chunk.embedding.cosine_distance(query_vector).label("distance"),
+        # 1. Embedder la requête — même modèle que l'ingestion (obligatoire)
+        query_embeddings = await embed_texts([query])
+        query_vector = query_embeddings[0]
+
+        # 2. Requête pgvector : distance cosine ORDER BY ASC = plus proche en premier
+        stmt = (
+            select(
+                Chunk.id,
+                Chunk.content,
+                Chunk.chunk_index,
+                Document.filename,
+                Document.id.label("document_id"),
+                Chunk.embedding.cosine_distance(query_vector).label("distance"),
+            )
+            .join(Document, Chunk.document_id == Document.id)
+            .where(Chunk.embedding.is_not(None))
+            .order_by(Chunk.embedding.cosine_distance(query_vector))
+            .limit(top_k)
         )
-        .join(Document, Chunk.document_id == Document.id)
-        .where(Chunk.embedding.is_not(None))
-        .order_by(Chunk.embedding.cosine_distance(query_vector))
-        .limit(top_k)
-    )
 
-    result = await db.execute(stmt)
-    rows = result.mappings().all()
+        result = await db.execute(stmt)
+        rows = result.mappings().all()
+
+        span.set_attribute("rag.results_count", len(rows))
 
     logger.info(
         "chunks_retrieved",

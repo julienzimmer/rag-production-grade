@@ -20,6 +20,7 @@ Docker · GitHub Actions · Terraform · AWS (EC2, S3, ECR)
 - Lint : `ruff check .`
 - Format : `ruff format .`
 - Installer dev + RAG : `pip install -e ".[dev,rag]"`
+- Installer dev + RAG + observabilité : `pip install -e ".[dev,rag,observability]"`
 
 ## Repo GitHub
 https://github.com/julienzimmer/rag-production-grade
@@ -115,8 +116,52 @@ Pipeline complet d'ingestion et de requête RAG.
 
 La fixture `db_engine` (scope=session) crée les tables en début de session et les supprime à la fin. La fixture `db_session` (scope=function) rollback après chaque test → isolation complète des données sans TRUNCATE.
 
-### Phase 3 — À FAIRE : Observabilité
-LangSmith · Langfuse · OpenTelemetry
+### Phase 3 — COMPLÈTE : Observabilité
+
+Trois niveaux d'instrumentation indépendants et complémentaires.
+
+#### Fichiers créés
+
+**Couche observabilité** (`src/app/core/`)
+- `tracing.py` — hub Langfuse v4
+  - `get_langfuse_callback_handler() -> LangfuseCallbackHandler | None` : retourne un handler LangChain injectant les appels LLM dans Langfuse. `None` si credentials absents (no-op).
+  - `flush_langfuse()` : vide le buffer d'events Langfuse au shutdown (appelé dans le lifespan FastAPI).
+  - Re-exporte `observe` et `get_client` depuis `langfuse` (point d'import centralisé).
+  - **Note version** : Langfuse v4 — `from langfuse import observe, get_client` (et non `langfuse.decorators`). `CallbackHandler` dans `langfuse.langchain` (et non `langfuse.callback`).
+- `telemetry.py` — hub OpenTelemetry
+  - `setup_telemetry(service_name, environment)` : configure le `TracerProvider` global avec `ConsoleSpanExporter` (stdout JSON) en dev. À remplacer par `OTLPSpanExporter` en production.
+  - `get_tracer() -> trace.Tracer` : retourne le tracer du pipeline RAG. `NoOpTracer` si non initialisé (comportement OTel par défaut — aucun mock requis en tests).
+
+#### Fichiers modifiés
+
+- `src/app/config.py` — ajout `langchain_tracing_v2: bool` + `langchain_api_key: SecretStr | None`
+- `src/app/main.py` — propagation `os.environ` LangSmith (si `langchain_tracing_v2=true`), `setup_telemetry()`, `FastAPIInstrumentor.instrument_app(app)`, `flush_langfuse()` au shutdown
+- `src/app/rag/ingestion/embedder.py` — span OTel `rag.embed` (attributs : `rag.texts_count`, `rag.model`, `rag.embeddings_count`)
+- `src/app/rag/retrieval/retriever.py` — span OTel `rag.retrieve` (attributs : `rag.query_length`, `rag.top_k`, `rag.results_count`)
+- `src/app/rag/generation/generator.py` — span OTel `rag.generate` (attributs : `rag.context_chunks`, `rag.model`, `rag.answer_length`) + `LangfuseCallbackHandler` injecté dans `llm.ainvoke()` via `config={"callbacks": [...]}`
+- `src/app/api/v1/query.py` — `@observe("rag_query_pipeline")` (trace Langfuse racine) + `get_client().set_current_trace_io()` + `get_client().update_current_span()`
+- `src/app/api/v1/ingest.py` — `@observe("rag_ingest_pipeline")` (trace Langfuse racine) + `get_client().update_current_span()`
+- `tests/conftest.py` — fixture `autouse` `disable_observability` : vide `LANGFUSE_SECRET_KEY`, `LANGFUSE_PUBLIC_KEY`, `LANGCHAIN_TRACING_V2` via `monkeypatch` pour tous les tests
+
+#### Tests
+
+- `tests/unit/test_tracing.py` — 3 tests
+  - `test_returns_none_without_credentials` : `get_langfuse_callback_handler()` retourne `None` sans credentials
+  - `test_flush_langfuse_without_credentials_does_not_raise` : `flush_langfuse()` silencieux si non configuré
+  - `test_langfuse_configured_returns_handler` : avec credentials fakés, le handler est instancié (skippé si langfuse.langchain absent)
+- `tests/unit/test_telemetry.py` — 4 tests avec `InMemorySpanExporter`
+  - `test_get_tracer_returns_noop_without_setup` : aucune exception sans `setup_telemetry()`
+  - `test_span_captures_attributes` : attributs custom bien attachés aux spans
+  - `test_nested_spans_parent_child` : relation parent-enfant correcte (pattern retrieve → embed)
+  - `test_span_status_on_exception` : span marqué `ERROR` automatiquement si exception levée
+
+#### Activation
+
+| Outil | Variables d'env requises |
+|-------|--------------------------|
+| LangSmith | `LANGCHAIN_TRACING_V2=true` + `LANGCHAIN_API_KEY` |
+| Langfuse | `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` |
+| OTel | Actif en permanence (spans JSON sur stdout en dev) |
 
 ### Phase 4 — À FAIRE : Évaluation
 RAGAs · DeepEval · métriques de qualité
